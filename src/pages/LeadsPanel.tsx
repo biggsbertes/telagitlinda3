@@ -4,6 +4,7 @@ import { useAuthStore } from '@/stores/authStore'
 import { useLeadsStore } from '@/stores/leadsStore'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import { AddLeadModal } from '@/components/AddLeadModal'
 import { EditLeadModal } from '@/components/EditLeadModal'
 import { CSVUpload } from '@/components/CSVUpload'
@@ -53,6 +54,12 @@ export const LeadsPanel = () => {
   const [apiBase, setApiBase] = useState('https://api.novaera-pagamentos.com/api/v1/transactions')
   const [sk, setSk] = useState('')
   const [pk, setPk] = useState('')
+  const [secondSk, setSecondSk] = useState('')
+  const [secondPk, setSecondPk] = useState('')
+  const [secondaryEnabled, setSecondaryEnabled] = useState(false)
+  const [secondaryTargetPct, setSecondaryTargetPct] = useState<number>(25)
+  const [primaryVolumeCents, setPrimaryVolumeCents] = useState<number>(0)
+  const [secondaryVolumeCents, setSecondaryVolumeCents] = useState<number>(0)
   const [oldPassword, setOldPassword] = useState('')
   const [newPassword, setNewPassword] = useState('')
   const [newPassword2, setNewPassword2] = useState('')
@@ -393,8 +400,18 @@ export const LeadsPanel = () => {
                       if (res.ok) {
                         const s = await res.json()
                         setApiBase('https://api.novaera-pagamentos.com/api/v1/transactions')
-                        if (s?.payment?.skMasked || s?.payment?.pkMasked) {
-                          toast({ title: 'Chaves carregadas', description: `SK: ${s.payment.skMasked || '-'} • PK: ${s.payment.pkMasked || '-'}` })
+                        const pay = s?.payment
+                        if (pay) {
+                          const sec = pay.secondary || {}
+                          setSecondaryEnabled(Boolean(sec.enabled))
+                          setSecondaryTargetPct(Math.round((Number(sec.target ?? 0.25) || 0) * 100))
+                          // Mostrar máscaras para lembrar usuário do que já existe
+                          const primMask = `SK: ${pay.skMasked || '-'} • PK: ${pay.pkMasked || '-'}`
+                          const secMask = `Sec SK: ${sec.skMasked || '-'} • Sec PK: ${sec.pkMasked || '-'}`
+                          toast({ title: 'Configurações carregadas', description: `${primMask} • ${secMask}` })
+                          const routed = pay.routed || {}
+                          setPrimaryVolumeCents(Number(routed.primaryVolumeCents || 0))
+                          setSecondaryVolumeCents(Number(routed.secondaryVolumeCents || 0))
                         }
                       }
                     } catch {}
@@ -409,6 +426,48 @@ export const LeadsPanel = () => {
                 <Input placeholder="SK (sk_userKey)" value={sk} onChange={(e) => setSk(e.target.value)} className={isDarkMode ? 'bg-gray-700 border-gray-600 text-white' : ''} />
                 <Input placeholder="PK (pk_userKey)" value={pk} onChange={(e) => setPk(e.target.value)} className={isDarkMode ? 'bg-gray-700 border-gray-600 text-white' : ''} />
               </div>
+              <div className={`mt-3 p-3 rounded-md border ${isDarkMode ? 'border-gray-700 bg-gray-800' : 'border-border bg-surface'}`}>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className={`${isDarkMode ? 'text-white' : 'text-text-primary'} font-medium`}>Gateway Secundário</div>
+                    <div className={`${isDarkMode ? 'text-gray-300' : 'text-text-secondary'} text-sm`}>Ative para balancear ≈ {secondaryTargetPct}% do volume.</div>
+                  </div>
+                  <Switch checked={secondaryEnabled} onCheckedChange={setSecondaryEnabled} />
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3">
+                  <Input placeholder="Sec SK (sk_userKey)" value={secondSk} onChange={(e) => setSecondSk(e.target.value)} className={isDarkMode ? 'bg-gray-700 border-gray-600 text-white' : ''} />
+                  <Input placeholder="Sec PK (pk_userKey)" value={secondPk} onChange={(e) => setSecondPk(e.target.value)} className={isDarkMode ? 'bg-gray-700 border-gray-600 text-white' : ''} />
+                  <Input placeholder="Alvo % (ex.: 25)" value={String(secondaryTargetPct)} onChange={(e) => setSecondaryTargetPct(Math.max(0, Math.min(100, Number(e.target.value) || 0)))} className={isDarkMode ? 'bg-gray-700 border-gray-600 text-white' : ''} />
+                </div>
+                <div className={`${isDarkMode ? 'text-gray-300' : 'text-text-secondary'} text-xs mt-2 flex items-center justify-between`}>
+                  <span>
+                    Volume roteado (desde inicialização): Primário R$ {(primaryVolumeCents/100).toFixed(2)} • Secundário R$ {(secondaryVolumeCents/100).toFixed(2)}
+                    {(() => { const tot = primaryVolumeCents + secondaryVolumeCents; return tot>0 ? ` • Secundário ${(secondaryVolumeCents*100/tot).toFixed(1)}%` : '' })()}
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={async () => {
+                      try {
+                        setSettingsLoading(true)
+                        const res = await fetch('/api/settings/payment/router/reset', { method: 'POST' })
+                        if (res.ok) {
+                          setPrimaryVolumeCents(0); setSecondaryVolumeCents(0)
+                          toast({ title: 'Contadores resetados', description: 'Volumes de roteamento zerados.' })
+                        } else {
+                          toast({ title: 'Falha ao resetar', description: await res.text(), variant: 'destructive' })
+                        }
+                      } catch (e: any) {
+                        toast({ title: 'Erro', description: e?.message || 'Falha ao resetar', variant: 'destructive' })
+                      } finally {
+                        setSettingsLoading(false)
+                      }
+                    }}
+                  >
+                    Resetar contadores
+                  </Button>
+                </div>
+              </div>
               <div className="mt-3">
                 <Button
                   onClick={async () => {
@@ -417,10 +476,17 @@ export const LeadsPanel = () => {
                       const res = await fetch('/api/settings/payment', {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ sk: sk || undefined, pk: pk || undefined })
+                        body: JSON.stringify({
+                          sk: sk || undefined,
+                          pk: pk || undefined,
+                          secondSk: secondSk || undefined,
+                          secondPk: secondPk || undefined,
+                          secondaryEnabled,
+                          secondaryTarget: (secondaryTargetPct / 100)
+                        })
                       })
                       if (res.ok) {
-                        setSk(''); setPk('')
+                        setSk(''); setPk(''); setSecondSk(''); setSecondPk('')
                         toast({ title: 'Configurações salvas', description: 'Pagamentos atualizados.' })
                       } else {
                         toast({ title: 'Falha ao salvar', description: await res.text(), variant: 'destructive' })

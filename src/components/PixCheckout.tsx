@@ -113,6 +113,7 @@ export const PixCheckout = ({
             externalId: response.data.externalId,
             secureId: response.data.secureId,
             secureUrl: response.data.secureUrl,
+            gateway: (response as any)?.gatewayUsed === 'secondary' ? 'secondary' : 'primary',
             created_at: response.data.createdAt,
           }).catch(() => void 0)
         }

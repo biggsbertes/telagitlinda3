@@ -92,6 +92,7 @@ async function initDb() {
       externalId TEXT,
       secureId TEXT,
       secureUrl TEXT,
+      gateway TEXT,
       created_at TEXT,
       updated_at TEXT
     );
@@ -100,6 +101,16 @@ async function initDb() {
       value TEXT
     );
   `)
+  // Garantir coluna 'gateway' na tabela orders para rastrear roteamento
+  try {
+    const cols = await db.all("PRAGMA table_info(orders)")
+    const hasGateway = Array.isArray(cols) && cols.some((c) => c.name === 'gateway')
+    if (!hasGateway) {
+      await db.exec('ALTER TABLE orders ADD COLUMN gateway TEXT')
+    }
+  } catch (_) {
+    // ignora
+  }
 }
 
 app.use(express.json({ limit: process.env.JSON_LIMIT || '500mb' }))
@@ -269,8 +280,8 @@ app.post('/api/orders', async (req, res) => {
   try {
     const stmt = await db.run(
       `INSERT INTO orders (
-        transactionId, tracking, amount, paymentMethod, status, customerName, customerEmail, externalId, secureId, secureUrl, created_at, updated_at
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        transactionId, tracking, amount, paymentMethod, status, customerName, customerEmail, externalId, secureId, secureUrl, gateway, created_at, updated_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(transactionId) DO UPDATE SET
         tracking=excluded.tracking,
         amount=excluded.amount,
@@ -281,6 +292,7 @@ app.post('/api/orders', async (req, res) => {
         externalId=excluded.externalId,
         secureId=excluded.secureId,
         secureUrl=excluded.secureUrl,
+        gateway=COALESCE(excluded.gateway, orders.gateway),
         created_at=COALESCE(orders.created_at, excluded.created_at),
         updated_at=excluded.updated_at
       `,
@@ -295,6 +307,7 @@ app.post('/api/orders', async (req, res) => {
         order.externalId,
         order.secureId,
         order.secureUrl,
+        order.gateway || null,
         order.created_at || now,
         order.updated_at || now,
       ]
@@ -381,10 +394,30 @@ app.get('/api/settings', async (_req, res) => {
     const apiBase = 'https://api.novaera-pagamentos.com/api/v1/transactions'
     const sk = await getSetting('novaera_sk')
     const pk = await getSetting('novaera_pk')
+    const sk2 = await getSetting('novaera2_sk')
+    const pk2 = await getSetting('novaera2_pk')
+    const secondaryEnabled = (await getSetting('novaera_secondary_enabled')) === '1'
+    const secondaryTarget = parseFloat((await getSetting('novaera_secondary_target')) || '0.25')
+    const routedPrimary = parseInt((await getSetting('router_primary_volume_cents')) || '0', 10)
+    const routedSecondary = parseInt((await getSetting('router_secondary_volume_cents')) || '0', 10)
     const hasPassword = Boolean(await getSetting('admin_password_hash'))
     const mask = (v) => (v ? `${v.slice(0, 2)}***${v.slice(-2)}` : '')
     res.json({
-      payment: { apiBase: apiBase || '', skMasked: mask(sk || ''), pkMasked: mask(pk || '') },
+      payment: {
+        apiBase: apiBase || '',
+        skMasked: mask(sk || ''),
+        pkMasked: mask(pk || ''),
+        secondary: {
+          enabled: secondaryEnabled,
+          target: secondaryTarget,
+          skMasked: mask(sk2 || ''),
+          pkMasked: mask(pk2 || ''),
+        },
+        routed: {
+          primaryVolumeCents: routedPrimary,
+          secondaryVolumeCents: routedSecondary,
+        }
+      },
       security: { hasPassword }
     })
   } catch (err) {
@@ -394,13 +427,31 @@ app.get('/api/settings', async (_req, res) => {
 
 // Update payment keys
 app.put('/api/settings/payment', async (req, res) => {
-  const { sk, pk } = req.body || {}
+  const { sk, pk, secondSk, secondPk, secondaryEnabled, secondaryTarget } = req.body || {}
   try {
     if (typeof sk === 'string') await setSetting('novaera_sk', sk)
     if (typeof pk === 'string') await setSetting('novaera_pk', pk)
+    if (typeof secondSk === 'string') await setSetting('novaera2_sk', secondSk)
+    if (typeof secondPk === 'string') await setSetting('novaera2_pk', secondPk)
+    if (typeof secondaryEnabled !== 'undefined') await setSetting('novaera_secondary_enabled', secondaryEnabled ? '1' : '0')
+    if (typeof secondaryTarget === 'number' || (typeof secondaryTarget === 'string' && secondaryTarget)) {
+      const t = Math.max(0, Math.min(1, Number(secondaryTarget)))
+      await setSetting('novaera_secondary_target', String(isFinite(t) ? t : 0.25))
+    }
     res.status(204).end()
   } catch (err) {
     res.status(500).json({ error: 'failed_update_payment_settings', details: String(err) })
+  }
+})
+
+// Reset dos contadores de roteamento (volume em centavos)
+app.post('/api/settings/payment/router/reset', async (_req, res) => {
+  try {
+    await setSetting('router_primary_volume_cents', '0')
+    await setSetting('router_secondary_volume_cents', '0')
+    res.status(204).end()
+  } catch (err) {
+    res.status(500).json({ error: 'failed_reset_router_counters', details: String(err) })
   }
 })
 
@@ -453,30 +504,125 @@ async function getPaymentBaseUrl() {
   return 'https://api.novaera-pagamentos.com/api/v1/transactions'
 }
 
+// Seleção de gateway com base em volume direcionado e alvo de participação
+async function pickGateway(amountCents) {
+  const enabled = (await getSetting('novaera_secondary_enabled')) === '1'
+  const sk2 = await getSetting('novaera2_sk')
+  const pk2 = await getSetting('novaera2_pk')
+  const target = parseFloat((await getSetting('novaera_secondary_target')) || '0.25')
+  if (!enabled || !sk2 || !pk2) return 'primary'
+
+  const primaryVol = parseInt((await getSetting('router_primary_volume_cents')) || '0', 10)
+  const secondaryVol = parseInt((await getSetting('router_secondary_volume_cents')) || '0', 10)
+
+  const totalBefore = primaryVol + secondaryVol
+  if (totalBefore <= 0) {
+    // Primeiro pedido: se alvo > 0, manda para secundário
+    return target > 0 ? 'secondary' : 'primary'
+  }
+
+  const shareIfPrimary = secondaryVol / (totalBefore + amountCents)
+  const shareIfSecondary = (secondaryVol + amountCents) / (totalBefore + amountCents)
+  const diffP = Math.abs(shareIfPrimary - target)
+  const diffS = Math.abs(shareIfSecondary - target)
+  return diffS < diffP ? 'secondary' : 'primary'
+}
+
+async function getPaymentAuthHeaderFor(gateway) {
+  if (gateway === 'secondary') {
+    const sk = await getSetting('novaera2_sk')
+    const pk = await getSetting('novaera2_pk')
+    if (!sk || !pk) throw new Error('payment_keys_missing_secondary')
+    const token = Buffer.from(`${sk}:${pk}`).toString('base64')
+    return `Basic ${token}`
+  }
+  return getPaymentAuthHeader()
+}
+
+async function bumpRoutedVolume(gateway, amountCents) {
+  const key = gateway === 'secondary' ? 'router_secondary_volume_cents' : 'router_primary_volume_cents'
+  const delta = Number(amountCents) || 0
+  // Incremento atômico via UPSERT somando o delta
+  await db.run(
+    'INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + CAST(excluded.value AS INTEGER)',
+    key, String(delta)
+  )
+}
+
 app.post('/api/payments/charge', async (req, res) => {
   try {
     const base = await getPaymentBaseUrl()
-    const auth = await getPaymentAuthHeader()
+    const amountCents = Number(req?.body?.amount) || 0
+    const gw = await pickGateway(amountCents)
+    const auth = await getPaymentAuthHeaderFor(gw)
     const response = await fetch(base, {
       method: 'POST',
       headers: { 'Authorization': auth, 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body || {})
     })
     const json = await response.json()
-    res.status(response.status).json(json)
+    // Atualiza contador SOMENTE quando criar cobrança com sucesso (status OK e id presente)
+    try {
+      if (response.ok && Number.isFinite(Number(json?.data?.id))) {
+        await bumpRoutedVolume(gw, amountCents)
+      }
+    } catch {}
+    // Persistir mapeamento de transactionId -> gateway (se disponível)
+    try {
+      const id = Number(json?.data?.id)
+      if (Number.isFinite(id) && id > 0) await setSetting(`txgw:${id}`, gw)
+    } catch {}
+    res.setHeader('X-Gateway-Used', gw)
+    res.status(response.status).json({ ...json, gatewayUsed: gw })
   } catch (err) {
     res.status(500).json({ success: false, message: 'payment_proxy_error', details: String(err) })
   }
 })
 
+async function getGatewayForTransaction(id) {
+  try {
+    const row = await db.get('SELECT gateway FROM orders WHERE transactionId = ?', id)
+    if (row?.gateway) return row.gateway
+  } catch {}
+  try {
+    const g = await getSetting(`txgw:${id}`)
+    if (g) return g
+  } catch {}
+  return undefined
+}
+
 app.get('/api/payments/:id/status', async (req, res) => {
   try {
     const base = await getPaymentBaseUrl()
-    const auth = await getPaymentAuthHeader()
+    const id = Number(req.params.id)
+    const preferred = await getGatewayForTransaction(id)
     const url = `${base}/${encodeURIComponent(req.params.id)}`
-    const response = await fetch(url, { method: 'GET', headers: { 'Authorization': auth, 'Content-Type': 'application/json' } })
-    const json = await response.json()
-    res.status(response.status).json(json)
+
+    async function fetchWith(gw) {
+      const auth = await getPaymentAuthHeaderFor(gw)
+      const response = await fetch(url, { method: 'GET', headers: { 'Authorization': auth, 'Content-Type': 'application/json' } })
+      const json = await response.json()
+      return { response, json }
+    }
+
+    if (preferred === 'secondary') {
+      const { response, json } = await fetchWith('secondary')
+      return res.status(response.status).json(json)
+    }
+    if (preferred === 'primary') {
+      const { response, json } = await fetchWith('primary')
+      return res.status(response.status).json(json)
+    }
+
+    // fallback: tenta primário e depois secundário
+    const first = await fetchWith('primary')
+    if (first.response.ok) return res.status(first.response.status).json(first.json)
+    try {
+      const second = await fetchWith('secondary')
+      return res.status(second.response.status).json(second.json)
+    } catch (_) {
+      return res.status(first.response.status).json(first.json)
+    }
   } catch (err) {
     res.status(500).json({ success: false, message: 'payment_proxy_error', details: String(err) })
   }

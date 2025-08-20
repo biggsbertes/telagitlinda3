@@ -41,7 +41,7 @@ export const OrdersTable = ({ isDarkMode }: OrdersTableProps) => {
         ? 'bg-gray-800 border-gray-700' 
         : 'bg-white border-border'
     }`}>
-      <div className={`grid grid-cols-6 gap-2 px-4 py-4 text-sm font-semibold uppercase tracking-wide transition-colors duration-200 ${
+      <div className={`grid grid-cols-7 gap-2 px-4 py-4 text-sm font-semibold uppercase tracking-wide transition-colors duration-200 ${
         isDarkMode 
           ? 'bg-gray-700 text-white' 
           : 'bg-surface-light text-text-primary'
@@ -52,12 +52,13 @@ export const OrdersTable = ({ isDarkMode }: OrdersTableProps) => {
         <div>Método</div>
         <div>Status</div>
         <div>Cliente</div>
+        <div>Gateway</div>
       </div>
       <div className={`divide-y transition-colors duration-200 ${
         isDarkMode ? 'divide-gray-700' : 'divide-border-light'
       }`}>
         {orders.map(o => (
-          <div key={o.id} className={`grid grid-cols-6 gap-2 px-4 py-3 text-sm transition-colors duration-200 ${
+          <div key={o.id} className={`grid grid-cols-7 gap-2 px-4 py-3 text-sm transition-colors duration-200 ${
             isDarkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-50'
           }`}>
             <div className={`transition-colors duration-200 ${
@@ -78,6 +79,15 @@ export const OrdersTable = ({ isDarkMode }: OrdersTableProps) => {
             <div className={`truncate transition-colors duration-200 ${
               isDarkMode ? 'text-gray-300' : 'text-text-secondary'
             }`}>{o.customerName || '-'}</div>
+            <div>
+              {o.gateway ? (
+                <Badge className={o.gateway === 'secondary' ? 'bg-purple-100 text-purple-800' : 'bg-slate-100 text-slate-800'}>
+                  {o.gateway === 'secondary' ? 'Secundário' : 'Primário'}
+                </Badge>
+              ) : (
+                <span className={`text-xs ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>-</span>
+              )}
+            </div>
           </div>
         ))}
       </div>

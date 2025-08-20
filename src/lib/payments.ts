@@ -46,6 +46,7 @@ export interface CreatePixResponse {
     };
     createdAt?: string;
   };
+  gatewayUsed?: 'primary' | 'secondary';
 }
 
 export type TransactionStatusResponse = CreatePixResponse;

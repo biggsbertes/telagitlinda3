@@ -12,6 +12,7 @@ export interface Order {
   externalId?: string;
   secureId?: string;
   secureUrl?: string;
+  gateway?: 'primary' | 'secondary';
   created_at?: string;
   updated_at?: string;
 }
